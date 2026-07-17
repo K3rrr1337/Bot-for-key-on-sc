@@ -7,23 +7,36 @@ import os
 import hashlib
 import secrets
 import asyncio
+import sys
 
 # ========== ПРОВЕРКА ПЕРЕМЕННЫХ ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     print("❌ BOT_TOKEN not set!")
-    exit(1)
+    sys.exit(1)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     print("❌ DATABASE_URL not set!")
-    exit(1)
+    sys.exit(1)
 
+# ========== БЕЗОПАСНЫЙ ПАРСИНГ ADMIN_IDS ==========
 ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "")
-ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS_STR.split(",") if x.strip()]
+ADMIN_IDS = []
+if ADMIN_IDS_STR:
+    for x in ADMIN_IDS_STR.split(","):
+        try:
+            if x.strip():
+                ADMIN_IDS.append(int(x.strip()))
+        except ValueError:
+            print(f"⚠️ Invalid ADMIN_IDS value: {x}")
+            pass
 
 print(f"🤖 Bot starting...")
 print(f"📋 Admin IDs: {ADMIN_IDS}")
+
+if not ADMIN_IDS:
+    print("⚠️ WARNING: No admin IDs set! Some commands will not work.")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -32,6 +45,8 @@ dp = Dispatcher()
 async def init_db():
     try:
         conn = await asyncpg.connect(DATABASE_URL)
+        print("✅ Connected to database")
+        
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
@@ -54,9 +69,10 @@ async def init_db():
         """)
         await conn.close()
         print("✅ Database initialized successfully!")
+        return True
     except Exception as e:
         print(f"❌ Database error: {e}")
-        raise
+        return False
 
 # ========== КОМАНДЫ ==========
 @dp.message(Command("start"))
@@ -127,8 +143,7 @@ async def gen_key(message: Message):
         await message.answer(
             f"✅ Key generated!\n\n"
             f"🔑 `{key_code}`\n"
-            f"📅 Valid for {days} days\n\n"
-            f"Use it in the client to login.",
+            f"📅 Valid for {days} days\n",
             parse_mode="Markdown"
         )
     except Exception as e:
@@ -217,9 +232,14 @@ async def unban_user(message: Message):
 
 # ========== ЗАПУСК ==========
 async def main():
-    await init_db()
+    print("🚀 Starting bot...")
     
-    # Убираем старые вебхуки (решаем конфликт)
+    # Инициализируем БД
+    if not await init_db():
+        print("❌ Failed to initialize database!")
+        return
+    
+    # Убираем старые вебхуки
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         print("✅ Webhook cleared")
@@ -230,4 +250,10 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("🛑 Bot stopped")
+    except Exception as e:
+        print(f"❌ Fatal error: {e}")
+        sys.exit(1)
