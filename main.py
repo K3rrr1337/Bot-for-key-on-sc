@@ -107,7 +107,7 @@ async def generate_key(request: KeyGenRequest, credentials: HTTPAuthorizationCre
     
     # Проверка админского токена (простая заглушка)
     # В реальном проекте используй нормальную проверку
-    ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "1908250518")
+    ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "admin_secret_123")
     if token != ADMIN_TOKEN:
         raise HTTPException(status_code=403, detail="Not authorized")
     
