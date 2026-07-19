@@ -1,4 +1,14 @@
 # bot.py
+import asyncio
+import sys
+import os
+import hashlib
+import secrets
+import logging
+import fcntl
+from datetime import datetime, timedelta
+from typing import Optional
+
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -6,12 +16,23 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 import asyncpg
-import os
-import hashlib
-import secrets
-import asyncio
-import sys
-from datetime import datetime
+
+# ========== БЛОКИРОВКА ДЛЯ ПРЕДОТВРАЩЕНИЯ ДВОЙНОГО ЗАПУСКА ==========
+try:
+    lock_file = open('/tmp/bot.lock', 'w')
+    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except IOError:
+    print("❌ Bot already running! Exiting...")
+    sys.exit(0)
+except Exception as e:
+    print(f"⚠️ Lock error: {e}")
+
+# ========== НАСТРОЙКА ЛОГГИРОВАНИЯ ==========
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # ========== ПРОВЕРКА ПЕРЕМЕННЫХ ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -41,6 +62,7 @@ print(f"📋 Admin IDs: {ADMIN_IDS}")
 if not ADMIN_IDS:
     print("⚠️ WARNING: No admin IDs set! Some commands will not work.")
 
+# ========== ИНИЦИАЛИЗАЦИЯ ==========
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
@@ -50,35 +72,51 @@ class RegistrationStates(StatesGroup):
     waiting_for_login = State()
     waiting_for_password = State()
 
-class KeyRequestStates(StatesGroup):
-    waiting_for_key_request = State()
-
-class ChangelogStates(StatesGroup):
-    waiting_for_changelog = State()
-
-class BanStates(StatesGroup):
-    waiting_for_ban_user = State()
-
-class UnbanStates(StatesGroup):
-    waiting_for_unban_user = State()
-
-# ========== ИНИЦИАЛИЗАЦИЯ БД ==========
+# ========== ИНИЦИАЛИЗАЦИЯ БД С МИГРАЦИЕЙ ==========
 async def init_db():
     try:
         conn = await asyncpg.connect(DATABASE_URL)
         print("✅ Connected to database")
         
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                login VARCHAR(50) UNIQUE NOT NULL,
-                password_hash VARCHAR(255) NOT NULL,
-                salt VARCHAR(50) NOT NULL,
-                is_banned BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                telegram_id BIGINT UNIQUE
+        # Проверяем существование таблицы users
+        table_exists = await conn.fetchval("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables 
+                WHERE table_name = 'users'
             )
         """)
+        
+        if not table_exists:
+            # Создаем таблицу с нуля
+            await conn.execute("""
+                CREATE TABLE users (
+                    id SERIAL PRIMARY KEY,
+                    login VARCHAR(50) UNIQUE NOT NULL,
+                    password_hash VARCHAR(255) NOT NULL,
+                    salt VARCHAR(50) NOT NULL,
+                    is_banned BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    telegram_id BIGINT UNIQUE
+                )
+            """)
+            print("✅ Table 'users' created with telegram_id")
+        else:
+            # Проверяем наличие колонки telegram_id
+            column_exists = await conn.fetchval("""
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = 'users' AND column_name = 'telegram_id'
+                )
+            """)
+            
+            if not column_exists:
+                # Добавляем колонку telegram_id
+                await conn.execute("""
+                    ALTER TABLE users ADD COLUMN telegram_id BIGINT UNIQUE
+                """)
+                print("✅ Added 'telegram_id' column to users table")
+        
+        # Создаем остальные таблицы
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS keys (
                 id SERIAL PRIMARY KEY,
@@ -90,6 +128,7 @@ async def init_db():
                 created_by INTEGER REFERENCES users(id)
             )
         """)
+        
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS key_requests (
                 id SERIAL PRIMARY KEY,
@@ -100,6 +139,7 @@ async def init_db():
                 processed_by INTEGER REFERENCES users(id)
             )
         """)
+        
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS changelog (
                 id SERIAL PRIMARY KEY,
@@ -108,12 +148,23 @@ async def init_db():
                 created_by INTEGER REFERENCES users(id)
             )
         """)
+        
         await conn.close()
         print("✅ Database initialized successfully!")
         return True
     except Exception as e:
         print(f"❌ Database error: {e}")
         return False
+
+# ========== HELPER FUNCTIONS ==========
+async def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+async def get_user_by_telegram_id(telegram_id: int, conn):
+    return await conn.fetchrow(
+        "SELECT id, login, is_banned FROM users WHERE telegram_id = $1",
+        telegram_id
+    )
 
 # ========== KEYBOARDS ==========
 def get_main_keyboard(is_admin: bool):
@@ -180,21 +231,36 @@ async def process_password(message: Message, state: FSMContext):
     
     conn = await asyncpg.connect(DATABASE_URL)
     try:
+        # Проверяем, не зарегистрирован ли уже пользователь
+        existing = await conn.fetchrow(
+            "SELECT id FROM users WHERE telegram_id = $1 OR login = $2",
+            message.from_user.id, login
+        )
+        
+        if existing:
+            await message.answer(
+                "❌ Вы уже зарегистрированы или логин занят!\n"
+                "Используйте /start для просмотра меню."
+            )
+            await state.clear()
+            return
+        
         await conn.execute(
             "INSERT INTO users (login, password_hash, salt, telegram_id) VALUES ($1, $2, $3, $4)",
             login, password_hash, salt, message.from_user.id
         )
         await message.answer(
             f"✅ Регистрация успешна!\n"
-            f"Логин: {login}\n"
-            f"Пароль: {password}\n\n"
+            f"👤 Логин: {login}\n"
+            f"🔑 Пароль: {password}\n\n"
             f"⚠️ Сохраните эти данные!",
             reply_markup=get_main_keyboard(await is_admin(message.from_user.id))
         )
     except asyncpg.exceptions.UniqueViolationError:
         await message.answer("❌ Пользователь с таким логином уже существует!")
     except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
+        logger.error(f"Registration error: {e}")
+        await message.answer(f"❌ Ошибка при регистрации: {str(e)}")
     finally:
         await conn.close()
         await state.clear()
@@ -203,31 +269,47 @@ async def process_password(message: Message, state: FSMContext):
 async def profile_callback(callback: CallbackQuery):
     conn = await asyncpg.connect(DATABASE_URL)
     try:
-        user = await conn.fetchrow(
-            "SELECT login, is_banned, created_at FROM users WHERE telegram_id = $1",
-            callback.from_user.id
-        )
+        user = await get_user_by_telegram_id(callback.from_user.id, conn)
         
         if not user:
-            await callback.message.answer("❌ Вы не зарегистрированы! Используйте /start для регистрации.")
+            await callback.message.answer(
+                "❌ Вы не зарегистрированы!\n"
+                "Используйте кнопку '📝 Регистрация' для создания аккаунта."
+            )
             await callback.answer()
             return
         
-        is_admin = await is_admin(callback.from_user.id)
-        status = "👑 Admin" if is_admin else "🎮 Player"
+        is_admin_user = await is_admin(callback.from_user.id)
+        status = "👑 Admin" if is_admin_user else "🎮 Player"
         ban_status = "🚫 Забанен" if user['is_banned'] else "✅ Активен"
+        
+        # Получаем информацию о ключах пользователя
+        keys = await conn.fetch(
+            "SELECT key_code, days_valid, used_at FROM keys WHERE used_by = $1 ORDER BY used_at DESC LIMIT 5",
+            user['id']
+        )
         
         text = f"👤 Профиль\n\n"
         text += f"Логин: {user['login']}\n"
         text += f"Статус: {status}\n"
         text += f"Состояние: {ban_status}\n"
-        text += f"Зарегистрирован: {user['created_at'].strftime('%d.%m.%Y %H:%M')}\n"
+        
+        if keys:
+            text += f"\n🔑 Активные ключи:\n"
+            for key in keys:
+                if key['used_at']:
+                    expiry = key['used_at'] + timedelta(days=key['days_valid'])
+                    days_left = (expiry - datetime.now()).days
+                    text += f"• {key['key_code'][:8]}... - {max(0, days_left)} дней\n"
+        else:
+            text += f"\n🔑 Нет активных ключей"
         
         await callback.message.answer(
             text,
-            reply_markup=get_main_keyboard(is_admin)
+            reply_markup=get_main_keyboard(is_admin_user)
         )
     except Exception as e:
+        logger.error(f"Profile error: {e}")
         await callback.message.answer(f"❌ Ошибка: {e}")
     finally:
         await conn.close()
@@ -256,6 +338,7 @@ async def view_changelog_callback(callback: CallbackQuery):
             reply_markup=get_main_keyboard(await is_admin(callback.from_user.id))
         )
     except Exception as e:
+        logger.error(f"Changelog error: {e}")
         await callback.message.answer(f"❌ Ошибка: {e}")
     finally:
         await conn.close()
@@ -265,10 +348,7 @@ async def view_changelog_callback(callback: CallbackQuery):
 async def request_key_callback(callback: CallbackQuery):
     conn = await asyncpg.connect(DATABASE_URL)
     try:
-        user = await conn.fetchrow(
-            "SELECT id, is_banned FROM users WHERE telegram_id = $1",
-            callback.from_user.id
-        )
+        user = await get_user_by_telegram_id(callback.from_user.id, conn)
         
         if not user:
             await callback.message.answer("❌ Сначала зарегистрируйтесь!")
@@ -308,12 +388,13 @@ async def request_key_callback(callback: CallbackQuery):
                 await bot.send_message(
                     admin_id,
                     f"📨 Новая заявка на ключ!\n"
-                    f"Пользователь: {user['login']}\n"
-                    f"ID заявки: {existing or 'новый'}"
+                    f"👤 Пользователь: {user['login']}\n"
+                    f"🆔 ID пользователя: {user['id']}"
                 )
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"Failed to notify admin {admin_id}: {e}")
     except Exception as e:
+        logger.error(f"Request key error: {e}")
         await callback.message.answer(f"❌ Ошибка: {e}")
     finally:
         await conn.close()
@@ -341,13 +422,15 @@ async def view_players_callback(callback: CallbackQuery):
         for user in users:
             status = "🚫" if user['is_banned'] else "✅"
             reg_date = user['created_at'].strftime('%d.%m.%Y')
-            text += f"{status} {user['login']} - {reg_date}\n"
+            telegram = f" (TG: {user['telegram_id']})" if user['telegram_id'] else ""
+            text += f"{status} {user['login']}{telegram} - {reg_date}\n"
         
         await callback.message.answer(
             text,
             reply_markup=get_main_keyboard(True)
         )
     except Exception as e:
+        logger.error(f"View players error: {e}")
         await callback.message.answer(f"❌ Ошибка: {e}")
     finally:
         await conn.close()
@@ -359,7 +442,10 @@ async def create_key_callback(callback: CallbackQuery):
         await callback.answer("❌ Недостаточно прав!", show_alert=True)
         return
     
-    await callback.message.answer("Введите количество дней действия ключа (число):")
+    await callback.message.answer(
+        "Введите количество дней действия ключа (число):\n"
+        "Пример: 30"
+    )
     await callback.answer()
 
 @dp.message(Command("genkey"))
@@ -375,6 +461,9 @@ async def gen_key(message: Message):
     
     try:
         days = int(args[1])
+        if days <= 0:
+            await message.answer("❌ Количество дней должно быть положительным числом!")
+            return
     except ValueError:
         await message.answer("❌ Некорректное число!")
         return
@@ -383,10 +472,7 @@ async def gen_key(message: Message):
     
     conn = await asyncpg.connect(DATABASE_URL)
     try:
-        user = await conn.fetchrow(
-            "SELECT id FROM users WHERE telegram_id = $1",
-            message.from_user.id
-        )
+        user = await get_user_by_telegram_id(message.from_user.id, conn)
         
         if user:
             await conn.execute(
@@ -407,6 +493,7 @@ async def gen_key(message: Message):
             reply_markup=get_main_keyboard(True)
         )
     except Exception as e:
+        logger.error(f"Gen key error: {e}")
         await message.answer(f"❌ Ошибка: {e}")
     finally:
         await conn.close()
@@ -446,6 +533,7 @@ async def ban_user(message: Message):
                 reply_markup=get_main_keyboard(True)
             )
     except Exception as e:
+        logger.error(f"Ban error: {e}")
         await message.answer(f"❌ Ошибка: {e}")
     finally:
         await conn.close()
@@ -485,6 +573,7 @@ async def unban_user(message: Message):
                 reply_markup=get_main_keyboard(True)
             )
     except Exception as e:
+        logger.error(f"Unban error: {e}")
         await message.answer(f"❌ Ошибка: {e}")
     finally:
         await conn.close()
@@ -495,7 +584,10 @@ async def add_changelog_callback(callback: CallbackQuery):
         await callback.answer("❌ Недостаточно прав!", show_alert=True)
         return
     
-    await callback.message.answer("Введите текст новости для ченжлога:")
+    await callback.message.answer(
+        "Введите текст новости для ченжлога:\n"
+        "Пример: Добавлена новая функция X"
+    )
     await callback.answer()
 
 @dp.message(Command("addlog"))
@@ -511,10 +603,7 @@ async def add_changelog(message: Message):
     
     conn = await asyncpg.connect(DATABASE_URL)
     try:
-        user = await conn.fetchrow(
-            "SELECT id FROM users WHERE telegram_id = $1",
-            message.from_user.id
-        )
+        user = await get_user_by_telegram_id(message.from_user.id, conn)
         
         if user:
             await conn.execute(
@@ -533,6 +622,7 @@ async def add_changelog(message: Message):
             reply_markup=get_main_keyboard(True)
         )
     except Exception as e:
+        logger.error(f"Add changelog error: {e}")
         await message.answer(f"❌ Ошибка: {e}")
     finally:
         await conn.close()
@@ -563,7 +653,7 @@ async def view_requests_callback(callback: CallbackQuery):
         text = "📋 Активные заявки:\n\n"
         for req in requests:
             status = "🚫" if req['is_banned'] else "✅"
-            text += f"ID: {req['id']}\n"
+            text += f"🆔 ID: {req['id']}\n"
             text += f"👤 {req['login']} {status}\n"
             text += f"📅 {req['created_at'].strftime('%d.%m.%Y %H:%M')}\n"
             text += f"---\n"
@@ -573,6 +663,7 @@ async def view_requests_callback(callback: CallbackQuery):
             reply_markup=get_request_keyboard()
         )
     except Exception as e:
+        logger.error(f"View requests error: {e}")
         await callback.message.answer(f"❌ Ошибка: {e}")
     finally:
         await conn.close()
@@ -584,10 +675,9 @@ async def process_key_request(callback: CallbackQuery):
         await callback.answer("❌ Недостаточно прав!", show_alert=True)
         return
     
-    # В этом упрощенном варианте обрабатываем только последнюю заявку
-    # В реальном приложении нужно хранить ID заявки в состоянии
     conn = await asyncpg.connect(DATABASE_URL)
     try:
+        # Получаем первую активную заявку
         request = await conn.fetchrow(
             """
             SELECT kr.id, kr.user_id, u.login, u.telegram_id
@@ -604,10 +694,7 @@ async def process_key_request(callback: CallbackQuery):
             await callback.answer()
             return
         
-        admin = await conn.fetchrow(
-            "SELECT id FROM users WHERE telegram_id = $1",
-            callback.from_user.id
-        )
+        admin = await get_user_by_telegram_id(callback.from_user.id, conn)
         
         if callback.data == "approve_key":
             # Генерируем ключ на 30 дней
@@ -625,21 +712,24 @@ async def process_key_request(callback: CallbackQuery):
             await callback.message.answer(
                 f"✅ Заявка одобрена!\n"
                 f"🔑 Ключ: `{key_code}`\n"
-                f"Пользователь: {request['login']}"
+                f"👤 Пользователь: {request['login']}\n"
+                f"📅 Действует 30 дней",
+                parse_mode="Markdown"
             )
             
             # Отправляем ключ пользователю
-            try:
-                await bot.send_message(
-                    request['telegram_id'],
-                    f"✅ Ваша заявка на ключ одобрена!\n\n"
-                    f"🔑 Ключ: `{key_code}`\n"
-                    f"📅 Действует 30 дней\n"
-                    f"Используйте ключ для активации чита.",
-                    parse_mode="Markdown"
-                )
-            except:
-                pass
+            if request['telegram_id']:
+                try:
+                    await bot.send_message(
+                        request['telegram_id'],
+                        f"✅ Ваша заявка на ключ одобрена!\n\n"
+                        f"🔑 Ключ: `{key_code}`\n"
+                        f"📅 Действует 30 дней\n"
+                        f"Используйте ключ для активации чита.",
+                        parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send key to user: {e}")
         else:
             await conn.execute(
                 "UPDATE key_requests SET status = 'rejected', processed_at = NOW(), processed_by = $1 WHERE id = $2",
@@ -648,40 +738,69 @@ async def process_key_request(callback: CallbackQuery):
             
             await callback.message.answer(f"❌ Заявка пользователя {request['login']} отклонена.")
             
-            try:
-                await bot.send_message(
-                    request['telegram_id'],
-                    "❌ Ваша заявка на ключ отклонена администратором."
-                )
-            except:
-                pass
+            # Уведомляем пользователя
+            if request['telegram_id']:
+                try:
+                    await bot.send_message(
+                        request['telegram_id'],
+                        "❌ Ваша заявка на ключ отклонена администратором."
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to notify user: {e}")
         
     except Exception as e:
+        logger.error(f"Process request error: {e}")
         await callback.message.answer(f"❌ Ошибка: {e}")
     finally:
         await conn.close()
         await callback.answer()
 
-# ========== HELPER FUNCTIONS ==========
-async def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
 # ========== ЗАПУСК ==========
 async def main():
     print("🚀 Starting bot...")
     
+    # Инициализируем БД с миграцией
     if not await init_db():
         print("❌ Failed to initialize database!")
         return
     
+    # Очищаем вебхуки с повторными попытками
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            print("✅ Webhook cleared")
+            break
+        except Exception as e:
+            print(f"⚠️ Webhook error (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2)
+            else:
+                print("⚠️ Could not clear webhook, continuing anyway...")
+    
+    # Проверяем подключение к Telegram
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        print("✅ Webhook cleared")
+        me = await bot.get_me()
+        print(f"✅ Bot connected: @{me.username} (ID: {me.id})")
     except Exception as e:
-        print(f"⚠️ Webhook error: {e}")
+        print(f"❌ Failed to connect to Telegram: {e}")
+        return
     
     print("🤖 Bot is running...")
-    await dp.start_polling(bot)
+    
+    # Запускаем polling с обработкой ошибок
+    while True:
+        try:
+            await dp.start_polling(
+                bot,
+                skip_updates=True,
+                allowed_updates=["message", "callback_query"]
+            )
+        except Exception as e:
+            logger.error(f"Polling error: {e}")
+            print(f"⚠️ Polling crashed, restarting in 5 seconds...")
+            await asyncio.sleep(5)
+            continue
 
 if __name__ == "__main__":
     try:
