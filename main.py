@@ -6,7 +6,7 @@ import secrets
 from datetime import datetime, timedelta
 import os
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional  # <-- ДОБАВИТЬ ЭТОТ ИМПОРТ
 
 app = FastAPI()
 
@@ -32,6 +32,7 @@ class KeyActivateRequest(BaseModel):
 class UserCreateRequest(BaseModel):
     login: str
     password: str
+    telegram_id: Optional[int] = None  # <-- ДОБАВИТЬ
 
 class KeyCreateRequest(BaseModel):
     days: int
@@ -58,7 +59,6 @@ async def root():
 @app.post("/api/auth")
 async def auth(request: AuthRequest, db=Depends(get_db)):
     """Аутентификация пользователя с проверкой ключа"""
-    # Проверяем пользователя
     user = await db.fetchrow(
         "SELECT id, password_hash, salt, is_banned FROM users WHERE login = $1",
         request.login
@@ -69,25 +69,21 @@ async def auth(request: AuthRequest, db=Depends(get_db)):
     if user['is_banned']:
         raise HTTPException(403, "Banned")
     
-    # Проверяем пароль
     salt = user['salt']
     input_hash = hashlib.pbkdf2_hmac('sha256', request.password.encode(), salt.encode(), 100000).hex()
     if not hmac.compare_digest(input_hash, user['password_hash']):
         raise HTTPException(401, "Invalid password")
     
-    # Проверяем ключ
     key = await db.fetchrow(
-        "SELECT id, days_valid, used_by, used_at, created_at FROM keys WHERE key_code = $1",
+        "SELECT id, days_valid, used_by, used_at FROM keys WHERE key_code = $1",
         request.key
     )
     if not key:
         raise HTTPException(401, "Invalid key")
     
-    # Проверяем, не использован ли ключ другим пользователем
     if key['used_by'] and key['used_by'] != user['id']:
-        raise HTTPException(401, "Key already used by another user")
+        raise HTTPException(401, "Key already used")
     
-    # Если ключ не использован, привязываем к пользователю
     if not key['used_by']:
         await db.execute(
             "UPDATE keys SET used_by = $1, used_at = $2 WHERE id = $3",
@@ -97,7 +93,6 @@ async def auth(request: AuthRequest, db=Depends(get_db)):
     else:
         used_at = key['used_at']
     
-    # Рассчитываем оставшиеся дни
     expiry = used_at + timedelta(days=key['days_valid'])
     days_left = (expiry - datetime.now()).days
     
@@ -113,7 +108,6 @@ async def auth(request: AuthRequest, db=Depends(get_db)):
 @app.post("/api/activate_key")
 async def activate_key(request: KeyActivateRequest, db=Depends(get_db)):
     """Активация ключа для пользователя"""
-    # Проверяем пользователя
     user = await db.fetchrow(
         "SELECT id, is_banned FROM users WHERE id = $1",
         request.user_id
@@ -124,7 +118,6 @@ async def activate_key(request: KeyActivateRequest, db=Depends(get_db)):
     if user['is_banned']:
         raise HTTPException(403, "User is banned")
     
-    # Проверяем ключ
     key = await db.fetchrow(
         "SELECT id, days_valid, used_by, used_at FROM keys WHERE key_code = $1",
         request.key_code
@@ -135,7 +128,6 @@ async def activate_key(request: KeyActivateRequest, db=Depends(get_db)):
     if key['used_by'] and key['used_by'] != user['id']:
         raise HTTPException(400, "Key already used")
     
-    # Активируем ключ
     await db.execute(
         "UPDATE keys SET used_by = $1, used_at = $2 WHERE id = $3",
         user['id'], datetime.now(), key['id']
@@ -154,7 +146,7 @@ async def activate_key(request: KeyActivateRequest, db=Depends(get_db)):
 async def get_users(db=Depends(get_db)):
     """Получить список всех пользователей"""
     users = await db.fetch(
-        "SELECT id, login, is_banned, created_at FROM users ORDER BY created_at DESC"
+        "SELECT id, login, is_banned, created_at, telegram_id FROM users ORDER BY created_at DESC"
     )
     
     return {
@@ -163,6 +155,7 @@ async def get_users(db=Depends(get_db)):
                 "id": user['id'],
                 "login": user['login'],
                 "is_banned": user['is_banned'],
+                "telegram_id": user['telegram_id'],
                 "created_at": user['created_at'].isoformat() if user['created_at'] else None
             }
             for user in users
@@ -194,7 +187,7 @@ async def get_user_keys(user_id: int, db=Depends(get_db)):
 async def check_key(key_code: str, db=Depends(get_db)):
     """Проверить статус ключа"""
     key = await db.fetchrow(
-        "SELECT key_code, days_valid, used_by, used_at FROM keys WHERE key_code = $1",
+        "SELECT key_code, days_valid, used_by, used_at, created_by FROM keys WHERE key_code = $1",
         key_code
     )
     
@@ -341,15 +334,20 @@ async def create_user(request: UserCreateRequest, db=Depends(get_db)):
     ).hex()
     
     try:
-        result = await db.execute(
-            "INSERT INTO users (login, password_hash, salt) VALUES ($1, $2, $3) RETURNING id",
-            request.login, password_hash, salt
+        result = await db.fetchrow(
+            """
+            INSERT INTO users (login, password_hash, salt, telegram_id) 
+            VALUES ($1, $2, $3, $4) 
+            RETURNING id
+            """,
+            request.login, password_hash, salt, request.telegram_id
         )
         
         return {
             "success": True,
             "login": request.login,
-            "user_id": result
+            "user_id": result['id'],
+            "telegram_id": request.telegram_id
         }
     except Exception as e:
         raise HTTPException(400, f"Failed to create user: {str(e)}")
@@ -391,7 +389,7 @@ async def unban_user(request: BanRequest, db=Depends(get_db)):
 async def startup():
     conn = await asyncpg.connect(DATABASE_URL)
     try:
-        # Создаем таблицы
+        # Создаем таблицы с правильной структурой
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
