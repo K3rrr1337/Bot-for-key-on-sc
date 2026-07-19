@@ -6,7 +6,7 @@ import secrets
 from datetime import datetime, timedelta
 import os
 from pydantic import BaseModel
-from typing import Optional  # <-- ДОБАВИТЬ ЭТОТ ИМПОРТ
+from typing import Optional
 
 app = FastAPI()
 
@@ -32,7 +32,7 @@ class KeyActivateRequest(BaseModel):
 class UserCreateRequest(BaseModel):
     login: str
     password: str
-    telegram_id: Optional[int] = None  # <-- ДОБАВИТЬ
+    telegram_id: Optional[int] = None
 
 class KeyCreateRequest(BaseModel):
     days: int
@@ -187,7 +187,7 @@ async def get_user_keys(user_id: int, db=Depends(get_db)):
 async def check_key(key_code: str, db=Depends(get_db)):
     """Проверить статус ключа"""
     key = await db.fetchrow(
-        "SELECT key_code, days_valid, used_by, used_at, created_by FROM keys WHERE key_code = $1",
+        "SELECT key_code, days_valid, used_by, used_at FROM keys WHERE key_code = $1",
         key_code
     )
     
@@ -309,10 +309,24 @@ async def create_key(request: KeyCreateRequest, db=Depends(get_db)):
     key_code = secrets.token_hex(16)
     
     try:
-        await db.execute(
-            "INSERT INTO keys (key_code, days_valid, created_by) VALUES ($1, $2, $3)",
-            key_code, request.days, request.user_id
-        )
+        # Проверяем существование таблицы и колонки
+        column_exists = await db.fetchval("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns 
+                WHERE table_name = 'keys' AND column_name = 'created_by'
+            )
+        """)
+        
+        if column_exists:
+            await db.execute(
+                "INSERT INTO keys (key_code, days_valid, created_by) VALUES ($1, $2, $3)",
+                key_code, request.days, request.user_id
+            )
+        else:
+            await db.execute(
+                "INSERT INTO keys (key_code, days_valid) VALUES ($1, $2)",
+                key_code, request.days
+            )
         
         return {
             "success": True,
@@ -334,14 +348,32 @@ async def create_user(request: UserCreateRequest, db=Depends(get_db)):
     ).hex()
     
     try:
-        result = await db.fetchrow(
-            """
-            INSERT INTO users (login, password_hash, salt, telegram_id) 
-            VALUES ($1, $2, $3, $4) 
-            RETURNING id
-            """,
-            request.login, password_hash, salt, request.telegram_id
-        )
+        # Проверяем существование колонки telegram_id
+        column_exists = await db.fetchval("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns 
+                WHERE table_name = 'users' AND column_name = 'telegram_id'
+            )
+        """)
+        
+        if column_exists and request.telegram_id is not None:
+            result = await db.fetchrow(
+                """
+                INSERT INTO users (login, password_hash, salt, telegram_id) 
+                VALUES ($1, $2, $3, $4) 
+                RETURNING id
+                """,
+                request.login, password_hash, salt, request.telegram_id
+            )
+        else:
+            result = await db.fetchrow(
+                """
+                INSERT INTO users (login, password_hash, salt) 
+                VALUES ($1, $2, $3) 
+                RETURNING id
+                """,
+                request.login, password_hash, salt
+            )
         
         return {
             "success": True,
@@ -384,6 +416,52 @@ async def unban_user(request: BanRequest, db=Depends(get_db)):
         "message": f"User {request.login} has been unbanned"
     }
 
+@app.get("/api/admin/requests")
+async def get_requests(db=Depends(get_db)):
+    """Получить все заявки на ключи (только для админов)"""
+    requests = await db.fetch(
+        """
+        SELECT kr.id, kr.user_id, u.login, u.is_banned, kr.status, kr.created_at, kr.processed_at
+        FROM key_requests kr
+        JOIN users u ON kr.user_id = u.id
+        ORDER BY kr.created_at DESC
+        """
+    )
+    
+    return {
+        "requests": [
+            {
+                "id": req['id'],
+                "user_id": req['user_id'],
+                "login": req['login'],
+                "is_banned": req['is_banned'],
+                "status": req['status'],
+                "created_at": req['created_at'].isoformat() if req['created_at'] else None,
+                "processed_at": req['processed_at'].isoformat() if req['processed_at'] else None
+            }
+            for req in requests
+        ]
+    }
+
+@app.get("/api/admin/stats")
+async def get_stats(db=Depends(get_db)):
+    """Получить статистику (только для админов)"""
+    total_users = await db.fetchval("SELECT COUNT(*) FROM users")
+    banned_users = await db.fetchval("SELECT COUNT(*) FROM users WHERE is_banned = TRUE")
+    total_keys = await db.fetchval("SELECT COUNT(*) FROM keys")
+    used_keys = await db.fetchval("SELECT COUNT(*) FROM keys WHERE used_by IS NOT NULL")
+    pending_requests = await db.fetchval("SELECT COUNT(*) FROM key_requests WHERE status = 'pending'")
+    
+    return {
+        "total_users": total_users,
+        "banned_users": banned_users,
+        "active_users": total_users - banned_users,
+        "total_keys": total_keys,
+        "used_keys": used_keys,
+        "pending_keys": total_keys - used_keys,
+        "pending_requests": pending_requests
+    }
+
 # ========== DATABASE INITIALIZATION ==========
 @app.on_event("startup")
 async def startup():
@@ -402,17 +480,37 @@ async def startup():
             )
         """)
         
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS keys (
-                id SERIAL PRIMARY KEY,
-                key_code VARCHAR(50) UNIQUE NOT NULL,
-                days_valid INTEGER NOT NULL,
-                used_by INTEGER REFERENCES users(id),
-                used_at TIMESTAMP,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                created_by INTEGER REFERENCES users(id)
+        # Проверяем наличие колонки created_by в keys
+        column_exists = await conn.fetchval("""
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns 
+                WHERE table_name = 'keys' AND column_name = 'created_by'
             )
         """)
+        
+        if not column_exists:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS keys (
+                    id SERIAL PRIMARY KEY,
+                    key_code VARCHAR(50) UNIQUE NOT NULL,
+                    days_valid INTEGER NOT NULL,
+                    used_by INTEGER REFERENCES users(id),
+                    used_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+        else:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS keys (
+                    id SERIAL PRIMARY KEY,
+                    key_code VARCHAR(50) UNIQUE NOT NULL,
+                    days_valid INTEGER NOT NULL,
+                    used_by INTEGER REFERENCES users(id),
+                    used_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    created_by INTEGER REFERENCES users(id)
+                )
+            """)
         
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS key_requests (
@@ -442,4 +540,4 @@ async def startup():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8080)
