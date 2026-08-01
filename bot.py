@@ -12,7 +12,7 @@ from typing import Optional
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ChatMember
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -57,8 +57,15 @@ if ADMIN_IDS_STR:
             print(f"⚠️ Invalid ADMIN_IDS value: {x}")
             pass
 
+# ========== КАНАЛЫ ДЛЯ ПРОВЕРКИ ПОДПИСКИ ==========
+REQUIRED_CHANNELS = [
+    "@Kerrr1337_pub",
+    "@AstraNewsCommunity"
+]
+
 print(f"🤖 Bot starting...")
 print(f"📋 Admin IDs: {ADMIN_IDS}")
+print(f"📢 Required channels: {', '.join(REQUIRED_CHANNELS)}")
 
 if not ADMIN_IDS:
     print("⚠️ WARNING: No admin IDs set! Some commands will not work.")
@@ -102,6 +109,90 @@ def generate_promo_code(length: int = 8) -> str:
         # Добавляем проверку на повторяющиеся символы для читаемости
         if len(set(code)) >= length // 2:  # Хотя бы половина символов уникальны
             return code
+
+async def check_subscription(user_id: int) -> tuple[bool, list[str]]:
+    """
+    Проверяет подписку пользователя на все необходимые каналы.
+    Возвращает (все_подписан, список_неподписанных_каналов)
+    """
+    not_subscribed = []
+    
+    for channel in REQUIRED_CHANNELS:
+        try:
+            # Получаем информацию о членстве в канале
+            chat_member = await bot.get_chat_member(channel, user_id)
+            
+            # Проверяем статус
+            if chat_member.status in ['left', 'kicked']:
+                not_subscribed.append(channel)
+        except Exception as e:
+            logger.error(f"Error checking subscription to {channel}: {e}")
+            # Если бот не может проверить, считаем что пользователь не подписан
+            not_subscribed.append(channel)
+    
+    return len(not_subscribed) == 0, not_subscribed
+
+def get_subscription_keyboard(not_subscribed_channels: list[str]) -> InlineKeyboardMarkup:
+    """Создает клавиатуру с кнопками для подписки на каналы"""
+    buttons = []
+    
+    for channel in not_subscribed_channels:
+        channel_url = f"https://t.me/{channel.replace('@', '')}"
+        buttons.append([InlineKeyboardButton(
+            text=f"📢 Подписаться на {channel}",
+            url=channel_url
+        )])
+    
+    buttons.append([InlineKeyboardButton(
+        text="🔄 Проверить подписку",
+        callback_data="check_subscription"
+    )])
+    
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+# ========== MIDDLEWARE ДЛЯ ПРОВЕРКИ ПОДПИСКИ ==========
+class SubscriptionMiddleware:
+    async def __call__(self, handler, event, data):
+        # Пропускаем проверку для администраторов
+        user_id = None
+        
+        if hasattr(event, 'from_user') and event.from_user:
+            user_id = event.from_user.id
+        elif hasattr(event, 'message') and event.message and event.message.from_user:
+            user_id = event.message.from_user.id
+        elif hasattr(event, 'callback_query') and event.callback_query and event.callback_query.from_user:
+            user_id = event.callback_query.from_user.id
+        
+        if not user_id:
+            return await handler(event, data)
+        
+        # Администраторы пропускают проверку
+        if user_id in ADMIN_IDS:
+            return await handler(event, data)
+        
+        # Проверяем подписку
+        is_subscribed, not_subscribed = await check_subscription(user_id)
+        
+        if not is_subscribed and not (hasattr(event, 'data') and event.data == 'check_subscription'):
+            # Если пользователь не подписан, отправляем сообщение
+            keyboard = get_subscription_keyboard(not_subscribed)
+            
+            if hasattr(event, 'answer'):
+                await event.answer()
+                await event.message.answer(
+                    "⚠️ Для использования бота необходимо подписаться на следующие каналы:\n\n"
+                    + "\n".join([f"• {channel}" for channel in not_subscribed]),
+                    reply_markup=keyboard
+                )
+            else:
+                await event.answer(
+                    "⚠️ Для использования бота необходимо подписаться на все каналы!",
+                    reply_markup=keyboard
+                )
+            return
+        
+        # Пользователь подписан или это запрос на проверку
+        return await handler(event, data)
 
 # ========== ИНИЦИАЛИЗАЦИЯ БД С МИГРАЦИЕЙ ==========
 async def init_db():
@@ -259,7 +350,8 @@ def get_main_keyboard(is_admin: bool):
         [InlineKeyboardButton(text="📝 Регистрация", callback_data="register")],
         [InlineKeyboardButton(text="🔑 Запросить ключ", callback_data="request_key")],
         [InlineKeyboardButton(text="📜 Ченжлог", callback_data="view_changelog")],
-        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")]
+        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
+        [InlineKeyboardButton(text="📢 Подписки", callback_data="check_subscription")]
     ])
     
     if is_admin:
@@ -283,22 +375,84 @@ def get_request_keyboard():
 # ========== COMMANDS ==========
 @dp.message(Command("start"))
 async def start(message: Message):
+    # Проверяем подписку
+    is_subscribed, not_subscribed = await check_subscription(message.from_user.id)
+    
+    if not is_subscribed and message.from_user.id not in ADMIN_IDS:
+        keyboard = get_subscription_keyboard(not_subscribed)
+        await message.answer(
+            "🚀 Добро пожаловать в Astra Key Management Bot!\n\n"
+            "⚠️ Для использования бота необходимо подписаться на все каналы:\n\n"
+            + "\n".join([f"• {channel}" for channel in not_subscribed]) +
+            "\n\nПосле подписки нажмите кнопку 'Проверить подписку'.",
+            reply_markup=keyboard
+        )
+        return
+    
     await message.answer(
         "🚀 Astra Key Management Bot\n\n"
         "Добро пожаловать! Используйте кнопки для навигации:\n"
         "• Регистрация - создайте аккаунт\n"
         "• Запросить ключ - получите ключ доступа\n"
-        "• Профиль - информация о вашем аккаунте",
+        "• Профиль - информация о вашем аккаунте\n"
+        "• Подписки - проверить подписку на каналы",
         reply_markup=get_main_keyboard(await is_admin(message.from_user.id))
     )
 
 @dp.message(Command("menu"))
 async def menu(message: Message):
+    # Проверяем подписку
+    is_subscribed, not_subscribed = await check_subscription(message.from_user.id)
+    
+    if not is_subscribed and message.from_user.id not in ADMIN_IDS:
+        keyboard = get_subscription_keyboard(not_subscribed)
+        await message.answer(
+            "⚠️ Для использования бота необходимо подписаться на все каналы!\n\n"
+            + "\n".join([f"• {channel}" for channel in not_subscribed]),
+            reply_markup=keyboard
+        )
+        return
+    
     await start(message)
+
+# ========== CHECK SUBSCRIPTION ==========
+@dp.callback_query(lambda c: c.data == "check_subscription")
+async def check_subscription_callback(callback: CallbackQuery):
+    await callback.answer("🔍 Проверяем подписки...")
+    
+    is_subscribed, not_subscribed = await check_subscription(callback.from_user.id)
+    
+    if is_subscribed or callback.from_user.id in ADMIN_IDS:
+        await callback.message.edit_text(
+            "✅ Вы подписаны на все необходимые каналы!\n\n"
+            "🚀 Добро пожаловать в Astra Key Management Bot!\n"
+            "Используйте /menu для навигации.",
+            reply_markup=get_main_keyboard(await is_admin(callback.from_user.id))
+        )
+    else:
+        keyboard = get_subscription_keyboard(not_subscribed)
+        await callback.message.edit_text(
+            "⚠️ Вы не подписаны на следующие каналы:\n\n"
+            + "\n".join([f"• {channel}" for channel in not_subscribed]) +
+            "\n\nПосле подписки нажмите кнопку 'Проверить подписку'.",
+            reply_markup=keyboard
+        )
 
 # ========== REGISTRATION ==========
 @dp.callback_query(lambda c: c.data == "register")
 async def register_callback(callback: CallbackQuery, state: FSMContext):
+    # Проверяем подписку
+    is_subscribed, not_subscribed = await check_subscription(callback.from_user.id)
+    
+    if not is_subscribed and callback.from_user.id not in ADMIN_IDS:
+        keyboard = get_subscription_keyboard(not_subscribed)
+        await callback.message.answer(
+            "⚠️ Для регистрации необходимо подписаться на все каналы!",
+            reply_markup=keyboard
+        )
+        await callback.answer()
+        return
+    
     await callback.message.answer("Введите ваш логин:")
     await state.set_state(RegistrationStates.waiting_for_login)
     await callback.answer()
@@ -1000,6 +1154,7 @@ async def main():
         return
     
     print("🤖 Bot is running...")
+    print(f"📢 Checking subscriptions to: {', '.join(REQUIRED_CHANNELS)}")
     
     while True:
         try:
