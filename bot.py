@@ -12,7 +12,7 @@ from typing import Optional
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ChatMember
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, ChatMember, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -77,6 +77,10 @@ dp = Dispatcher(storage=storage)
 
 # ========== STATES FOR FSM ==========
 class RegistrationStates(StatesGroup):
+    waiting_for_login = State()
+    waiting_for_password = State()
+
+class LoginStates(StatesGroup):
     waiting_for_login = State()
     waiting_for_password = State()
 
@@ -149,6 +153,41 @@ def get_subscription_keyboard(not_subscribed_channels: list[str]) -> InlineKeybo
     )])
     
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_main_menu_keyboard(is_admin: bool, is_registered: bool = False) -> ReplyKeyboardMarkup:
+    """Создает основную клавиатуру меню"""
+    buttons = []
+    
+    # Кнопки регистрации/входа
+    if not is_registered:
+        buttons.append([KeyboardButton(text="📝 Регистрация")])
+        buttons.append([KeyboardButton(text="🔑 Войти")])
+    else:
+        buttons.append([KeyboardButton(text="👤 Профиль")])
+        buttons.append([KeyboardButton(text="🔑 Запросить ключ")])
+    
+    # Общие кнопки
+    buttons.append([KeyboardButton(text="📜 Ченжлог")])
+    buttons.append([KeyboardButton(text="📢 Проверить подписки")])
+    
+    # Админские кнопки
+    if is_admin:
+        buttons.extend([
+            [KeyboardButton(text="👥 Все игроки")],
+            [KeyboardButton(text="🔑 Создать ключ")],
+            [KeyboardButton(text="🚫 Бан игрока")],
+            [KeyboardButton(text="✅ Разбан игрока")],
+            [KeyboardButton(text="📝 Добавить в ченжлог")],
+            [KeyboardButton(text="📋 Заявки на ключи")]
+        ])
+    
+    buttons.append([KeyboardButton(text="📋 Меню")])
+    
+    return ReplyKeyboardMarkup(
+        keyboard=buttons,
+        resize_keyboard=True,
+        one_time_keyboard=False
+    )
 
 # ========== MIDDLEWARE ДЛЯ ПРОВЕРКИ ПОДПИСКИ ==========
 class SubscriptionMiddleware:
@@ -319,7 +358,7 @@ async def get_user_by_telegram_id(telegram_id: int, conn):
 
 async def get_user_by_login(login: str, conn):
     return await conn.fetchrow(
-        "SELECT id, login, is_banned FROM users WHERE login = $1",
+        "SELECT id, login, is_banned, password_hash, salt FROM users WHERE login = $1",
         login
     )
 
@@ -344,33 +383,14 @@ async def get_user_active_key(user_id: int, conn) -> Optional[dict]:
         user_id
     )
 
-# ========== KEYBOARDS ==========
-def get_main_keyboard(is_admin: bool):
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📝 Регистрация", callback_data="register")],
-        [InlineKeyboardButton(text="🔑 Запросить ключ", callback_data="request_key")],
-        [InlineKeyboardButton(text="📜 Ченжлог", callback_data="view_changelog")],
-        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
-        [InlineKeyboardButton(text="📢 Подписки", callback_data="check_subscription")]
-    ])
-    
-    if is_admin:
-        keyboard.inline_keyboard.extend([
-            [InlineKeyboardButton(text="👥 Все игроки", callback_data="view_players")],
-            [InlineKeyboardButton(text="🔑 Создать ключ", callback_data="create_key")],
-            [InlineKeyboardButton(text="🚫 Бан игрока", callback_data="ban_player")],
-            [InlineKeyboardButton(text="✅ Разбан игрока", callback_data="unban_player")],
-            [InlineKeyboardButton(text="📝 Добавить в ченжлог", callback_data="add_changelog")],
-            [InlineKeyboardButton(text="📋 Заявки на ключи", callback_data="view_requests")]
-        ])
-    
-    return keyboard
-
-def get_request_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Выдать ключ", callback_data="approve_key")],
-        [InlineKeyboardButton(text="❌ Отказать", callback_data="reject_key")]
-    ])
+async def check_user_registered(telegram_id: int) -> bool:
+    """Проверяет, зарегистрирован ли пользователь"""
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        user = await get_user_by_telegram_id(telegram_id, conn)
+        return user is not None
+    finally:
+        await conn.close()
 
 # ========== COMMANDS ==========
 @dp.message(Command("start"))
@@ -389,18 +409,20 @@ async def start(message: Message):
         )
         return
     
+    is_registered = await check_user_registered(message.from_user.id)
+    
     await message.answer(
         "🚀 Astra Key Management Bot\n\n"
-        "Добро пожаловать! Используйте кнопки для навигации:\n"
-        "• Регистрация - создайте аккаунт\n"
-        "• Запросить ключ - получите ключ доступа\n"
-        "• Профиль - информация о вашем аккаунте\n"
-        "• Подписки - проверить подписку на каналы",
-        reply_markup=get_main_keyboard(await is_admin(message.from_user.id))
+        "Добро пожаловать! Используйте кнопки меню для навигации.\n"
+        "Нажмите '📋 Меню' для просмотра всех доступных функций.",
+        reply_markup=get_main_menu_keyboard(
+            await is_admin(message.from_user.id),
+            is_registered
+        )
     )
 
-@dp.message(Command("menu"))
-async def menu(message: Message):
+@dp.message(lambda message: message.text == "📋 Меню")
+async def show_menu(message: Message):
     # Проверяем подписку
     is_subscribed, not_subscribed = await check_subscription(message.from_user.id)
     
@@ -413,9 +435,44 @@ async def menu(message: Message):
         )
         return
     
-    await start(message)
+    is_registered = await check_user_registered(message.from_user.id)
+    
+    await message.answer(
+        "📋 Главное меню\n\n"
+        "Выберите действие:",
+        reply_markup=get_main_menu_keyboard(
+            await is_admin(message.from_user.id),
+            is_registered
+        )
+    )
 
 # ========== CHECK SUBSCRIPTION ==========
+@dp.message(lambda message: message.text == "📢 Проверить подписки")
+async def check_subscription_command(message: Message):
+    await message.answer("🔍 Проверяем подписки...")
+    
+    is_subscribed, not_subscribed = await check_subscription(message.from_user.id)
+    
+    if is_subscribed or message.from_user.id in ADMIN_IDS:
+        is_registered = await check_user_registered(message.from_user.id)
+        await message.answer(
+            "✅ Вы подписаны на все необходимые каналы!\n\n"
+            "🚀 Добро пожаловать в Astra Key Management Bot!\n"
+            "Используйте меню для навигации.",
+            reply_markup=get_main_menu_keyboard(
+                await is_admin(message.from_user.id),
+                is_registered
+            )
+        )
+    else:
+        keyboard = get_subscription_keyboard(not_subscribed)
+        await message.answer(
+            "⚠️ Вы не подписаны на следующие каналы:\n\n"
+            + "\n".join([f"• {channel}" for channel in not_subscribed]) +
+            "\n\nПосле подписки нажмите кнопку 'Проверить подписку'.",
+            reply_markup=keyboard
+        )
+
 @dp.callback_query(lambda c: c.data == "check_subscription")
 async def check_subscription_callback(callback: CallbackQuery):
     await callback.answer("🔍 Проверяем подписки...")
@@ -423,11 +480,18 @@ async def check_subscription_callback(callback: CallbackQuery):
     is_subscribed, not_subscribed = await check_subscription(callback.from_user.id)
     
     if is_subscribed or callback.from_user.id in ADMIN_IDS:
+        is_registered = await check_user_registered(callback.from_user.id)
         await callback.message.edit_text(
             "✅ Вы подписаны на все необходимые каналы!\n\n"
             "🚀 Добро пожаловать в Astra Key Management Bot!\n"
-            "Используйте /menu для навигации.",
-            reply_markup=get_main_keyboard(await is_admin(callback.from_user.id))
+            "Используйте меню для навигации."
+        )
+        await callback.message.answer(
+            "📋 Главное меню",
+            reply_markup=get_main_menu_keyboard(
+                await is_admin(callback.from_user.id),
+                is_registered
+            )
         )
     else:
         keyboard = get_subscription_keyboard(not_subscribed)
@@ -439,23 +503,33 @@ async def check_subscription_callback(callback: CallbackQuery):
         )
 
 # ========== REGISTRATION ==========
-@dp.callback_query(lambda c: c.data == "register")
-async def register_callback(callback: CallbackQuery, state: FSMContext):
+@dp.message(lambda message: message.text == "📝 Регистрация")
+async def register_command(message: Message, state: FSMContext):
     # Проверяем подписку
-    is_subscribed, not_subscribed = await check_subscription(callback.from_user.id)
+    is_subscribed, not_subscribed = await check_subscription(message.from_user.id)
     
-    if not is_subscribed and callback.from_user.id not in ADMIN_IDS:
+    if not is_subscribed and message.from_user.id not in ADMIN_IDS:
         keyboard = get_subscription_keyboard(not_subscribed)
-        await callback.message.answer(
+        await message.answer(
             "⚠️ Для регистрации необходимо подписаться на все каналы!",
             reply_markup=keyboard
         )
-        await callback.answer()
         return
     
-    await callback.message.answer("Введите ваш логин:")
+    # Проверяем, не зарегистрирован ли уже пользователь
+    if await check_user_registered(message.from_user.id):
+        await message.answer(
+            "❌ Вы уже зарегистрированы!\n"
+            "Используйте '👤 Профиль' для просмотра данных.",
+            reply_markup=get_main_menu_keyboard(
+                await is_admin(message.from_user.id),
+                True
+            )
+        )
+        return
+    
+    await message.answer("Введите ваш логин:")
     await state.set_state(RegistrationStates.waiting_for_login)
-    await callback.answer()
 
 @dp.message(RegistrationStates.waiting_for_login)
 async def process_login(message: Message, state: FSMContext):
@@ -483,7 +557,7 @@ async def process_password(message: Message, state: FSMContext):
         if existing:
             await message.answer(
                 "❌ Вы уже зарегистрированы или логин занят!\n"
-                "Используйте /start для просмотра меню."
+                "Используйте '/start' для просмотра меню."
             )
             await state.clear()
             return
@@ -498,7 +572,10 @@ async def process_password(message: Message, state: FSMContext):
             f"🔑 Пароль: {password}\n\n"
             f"⚠️ Сохраните эти данные!\n"
             f"Теперь вы можете запросить ключ.",
-            reply_markup=get_main_keyboard(await is_admin(message.from_user.id))
+            reply_markup=get_main_menu_keyboard(
+                await is_admin(message.from_user.id),
+                True
+            )
         )
     except asyncpg.exceptions.UniqueViolationError:
         await message.answer("❌ Пользователь с таким логином уже существует!")
@@ -509,22 +586,120 @@ async def process_password(message: Message, state: FSMContext):
         await conn.close()
         await state.clear()
 
-# ========== PROFILE ==========
-@dp.callback_query(lambda c: c.data == "profile")
-async def profile_callback(callback: CallbackQuery):
+# ========== LOGIN ==========
+@dp.message(lambda message: message.text == "🔑 Войти")
+async def login_command(message: Message, state: FSMContext):
+    # Проверяем подписку
+    is_subscribed, not_subscribed = await check_subscription(message.from_user.id)
+    
+    if not is_subscribed and message.from_user.id not in ADMIN_IDS:
+        keyboard = get_subscription_keyboard(not_subscribed)
+        await message.answer(
+            "⚠️ Для входа необходимо подписаться на все каналы!",
+            reply_markup=keyboard
+        )
+        return
+    
+    # Проверяем, не зарегистрирован ли уже пользователь
+    if await check_user_registered(message.from_user.id):
+        await message.answer(
+            "❌ Вы уже авторизованы!\n"
+            "Используйте '👤 Профиль' для просмотра данных.",
+            reply_markup=get_main_menu_keyboard(
+                await is_admin(message.from_user.id),
+                True
+            )
+        )
+        return
+    
+    await message.answer("Введите ваш логин:")
+    await state.set_state(LoginStates.waiting_for_login)
+
+@dp.message(LoginStates.waiting_for_login)
+async def process_login_username(message: Message, state: FSMContext):
+    await state.update_data(login=message.text)
+    await message.answer("Введите ваш пароль:")
+    await state.set_state(LoginStates.waiting_for_password)
+
+@dp.message(LoginStates.waiting_for_password)
+async def process_login_password(message: Message, state: FSMContext):
+    data = await state.get_data()
+    login = data['login']
+    password = message.text
+    
     conn = await asyncpg.connect(DATABASE_URL)
     try:
-        user = await get_user_by_telegram_id(callback.from_user.id, conn)
+        user = await get_user_by_login(login, conn)
         
         if not user:
-            await callback.message.answer(
-                "❌ Вы не зарегистрированы!\n"
-                "Используйте кнопку '📝 Регистрация' для создания аккаунта."
-            )
-            await callback.answer()
+            await message.answer("❌ Неверный логин или пароль!")
+            await state.clear()
             return
         
-        is_admin_user = await is_admin(callback.from_user.id)
+        # Проверяем пароль
+        hash_obj = hashlib.pbkdf2_hmac('sha256', password.encode(), user['salt'].encode(), 100000)
+        password_hash = hash_obj.hex()
+        
+        if password_hash != user['password_hash']:
+            await message.answer("❌ Неверный логин или пароль!")
+            await state.clear()
+            return
+        
+        # Проверяем, не привязан ли уже этот аккаунт к другому телеграму
+        existing_telegram = await conn.fetchrow(
+            "SELECT telegram_id FROM users WHERE login = $1 AND telegram_id IS NOT NULL",
+            login
+        )
+        
+        if existing_telegram and existing_telegram['telegram_id'] != message.from_user.id:
+            await message.answer(
+                "❌ Этот аккаунт уже привязан к другому пользователю Telegram!\n"
+                "Обратитесь к администратору для решения проблемы."
+            )
+            await state.clear()
+            return
+        
+        # Обновляем telegram_id для пользователя
+        await conn.execute(
+            "UPDATE users SET telegram_id = $1 WHERE login = $2",
+            message.from_user.id, login
+        )
+        
+        await message.answer(
+            f"✅ Вы успешно вошли!\n"
+            f"👤 Логин: {login}",
+            reply_markup=get_main_menu_keyboard(
+                await is_admin(message.from_user.id),
+                True
+            )
+        )
+    except Exception as e:
+        logger.error(f"Login error: {e}")
+        await message.answer(f"❌ Ошибка при входе: {str(e)}")
+    finally:
+        await conn.close()
+        await state.clear()
+
+# ========== PROFILE ==========
+@dp.message(lambda message: message.text == "👤 Профиль")
+async def profile_command(message: Message):
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        user = await get_user_by_telegram_id(message.from_user.id, conn)
+        
+        if not user:
+            await message.answer(
+                "❌ Вы не авторизованы!\n"
+                "Используйте кнопку '🔑 Войти' для входа в существующий аккаунт\n"
+                "или '📝 Регистрация' для создания нового.",
+                reply_markup=get_main_menu_keyboard(
+                    await is_admin(message.from_user.id),
+                    False
+                )
+            )
+            return
+        
+        is_admin_user = await is_admin(message.from_user.id)
         status = "👑 Admin" if is_admin_user else "🎮 Player"
         ban_status = "🚫 Забанен" if user['is_banned'] else "✅ Активен"
         
@@ -546,20 +721,22 @@ async def profile_callback(callback: CallbackQuery):
             text += f"\n🔑 Нет активного ключа\n"
             text += f"Нажмите 'Запросить ключ' для получения."
         
-        await callback.message.answer(
+        await message.answer(
             text,
-            reply_markup=get_main_keyboard(is_admin_user)
+            reply_markup=get_main_menu_keyboard(
+                is_admin_user,
+                True
+            )
         )
     except Exception as e:
         logger.error(f"Profile error: {e}")
-        await callback.message.answer(f"❌ Ошибка: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
     finally:
         await conn.close()
-        await callback.answer()
 
 # ========== CHANGELOG ==========
-@dp.callback_query(lambda c: c.data == "view_changelog")
-async def view_changelog_callback(callback: CallbackQuery):
+@dp.message(lambda message: message.text == "📜 Ченжлог")
+async def view_changelog_command(message: Message):
     conn = await asyncpg.connect(DATABASE_URL)
     try:
         changelogs = await conn.fetch(
@@ -567,8 +744,7 @@ async def view_changelog_callback(callback: CallbackQuery):
         )
         
         if not changelogs:
-            await callback.message.answer("📭 Ченжлог пока пуст.")
-            await callback.answer()
+            await message.answer("📭 Ченжлог пока пуст.")
             return
         
         text = "📜 Последние изменения:\n\n"
@@ -576,42 +752,61 @@ async def view_changelog_callback(callback: CallbackQuery):
             text += f"{i}. {log['content']}\n"
             text += f"   📅 {log['created_at'].strftime('%d.%m.%Y %H:%M')}\n\n"
         
-        await callback.message.answer(
+        is_registered = await check_user_registered(message.from_user.id)
+        await message.answer(
             text,
-            reply_markup=get_main_keyboard(await is_admin(callback.from_user.id))
+            reply_markup=get_main_menu_keyboard(
+                await is_admin(message.from_user.id),
+                is_registered
+            )
         )
     except Exception as e:
         logger.error(f"Changelog error: {e}")
-        await callback.message.answer(f"❌ Ошибка: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
     finally:
         await conn.close()
-        await callback.answer()
 
 # ========== REQUEST KEY ==========
-@dp.callback_query(lambda c: c.data == "request_key")
-async def request_key_callback(callback: CallbackQuery):
+@dp.message(lambda message: message.text == "🔑 Запросить ключ")
+async def request_key_command(message: Message):
+    # Проверяем подписку
+    is_subscribed, not_subscribed = await check_subscription(message.from_user.id)
+    
+    if not is_subscribed and message.from_user.id not in ADMIN_IDS:
+        keyboard = get_subscription_keyboard(not_subscribed)
+        await message.answer(
+            "⚠️ Для запроса ключа необходимо подписаться на все каналы!",
+            reply_markup=keyboard
+        )
+        return
+    
     conn = await asyncpg.connect(DATABASE_URL)
     try:
-        user = await get_user_by_telegram_id(callback.from_user.id, conn)
+        user = await get_user_by_telegram_id(message.from_user.id, conn)
         
         if not user:
-            await callback.message.answer("❌ Сначала зарегистрируйтесь!")
-            await callback.answer()
+            await message.answer(
+                "❌ Сначала авторизуйтесь!\n"
+                "Используйте кнопку '🔑 Войти' для входа в существующий аккаунт\n"
+                "или '📝 Регистрация' для создания нового.",
+                reply_markup=get_main_menu_keyboard(
+                    await is_admin(message.from_user.id),
+                    False
+                )
+            )
             return
         
         if user['is_banned']:
-            await callback.message.answer("🚫 Вы забанены и не можете запрашивать ключи!")
-            await callback.answer()
+            await message.answer("🚫 Вы забанены и не можете запрашивать ключи!")
             return
         
         # Проверяем, есть ли уже активный ключ
         has_key = await has_active_key(user['id'], conn)
         if has_key:
-            await callback.message.answer(
+            await message.answer(
                 "❌ У вас уже есть активный ключ!\n"
                 "Один аккаунт может иметь только один активный ключ."
             )
-            await callback.answer()
             return
         
         existing = await conn.fetchrow(
@@ -620,8 +815,7 @@ async def request_key_callback(callback: CallbackQuery):
         )
         
         if existing:
-            await callback.message.answer("⏳ У вас уже есть активная заявка на получение ключа!")
-            await callback.answer()
+            await message.answer("⏳ У вас уже есть активная заявка на получение ключа!")
             return
         
         await conn.execute(
@@ -629,10 +823,13 @@ async def request_key_callback(callback: CallbackQuery):
             user['id']
         )
         
-        await callback.message.answer(
+        await message.answer(
             "✅ Заявка на получение ключа отправлена!\n"
             "Ожидайте решения администратора.",
-            reply_markup=get_main_keyboard(await is_admin(callback.from_user.id))
+            reply_markup=get_main_menu_keyboard(
+                await is_admin(message.from_user.id),
+                True
+            )
         )
         
         for admin_id in ADMIN_IDS:
@@ -647,16 +844,15 @@ async def request_key_callback(callback: CallbackQuery):
                 logger.error(f"Failed to notify admin {admin_id}: {e}")
     except Exception as e:
         logger.error(f"Request key error: {e}")
-        await callback.message.answer(f"❌ Ошибка: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
     finally:
         await conn.close()
-        await callback.answer()
 
 # ========== ADMIN: VIEW PLAYERS ==========
-@dp.callback_query(lambda c: c.data == "view_players")
-async def view_players_callback(callback: CallbackQuery):
-    if not await is_admin(callback.from_user.id):
-        await callback.answer("❌ Недостаточно прав!", show_alert=True)
+@dp.message(lambda message: message.text == "👥 Все игроки")
+async def view_players_command(message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.answer("❌ Недостаточно прав!")
         return
     
     conn = await asyncpg.connect(DATABASE_URL)
@@ -674,8 +870,7 @@ async def view_players_callback(callback: CallbackQuery):
         )
         
         if not users:
-            await callback.message.answer("👥 Нет зарегистрированных игроков.")
-            await callback.answer()
+            await message.answer("👥 Нет зарегистрированных игроков.")
             return
         
         text = "👥 Все игроки:\n\n"
@@ -686,30 +881,28 @@ async def view_players_callback(callback: CallbackQuery):
             telegram = f" (TG: {user['telegram_id']})" if user['telegram_id'] else ""
             text += f"{status} {key_status} {user['login']}{telegram} - {reg_date}\n"
         
-        await callback.message.answer(
+        await message.answer(
             text,
-            reply_markup=get_main_keyboard(True)
+            reply_markup=get_main_menu_keyboard(True, True)
         )
     except Exception as e:
         logger.error(f"View players error: {e}")
-        await callback.message.answer(f"❌ Ошибка: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
     finally:
         await conn.close()
-        await callback.answer()
 
 # ========== ADMIN: CREATE KEY ==========
-@dp.callback_query(lambda c: c.data == "create_key")
-async def create_key_callback(callback: CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id):
-        await callback.answer("❌ Недостаточно прав!", show_alert=True)
+@dp.message(lambda message: message.text == "🔑 Создать ключ")
+async def create_key_command(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        await message.answer("❌ Недостаточно прав!")
         return
     
-    await callback.message.answer(
+    await message.answer(
         "Введите количество дней действия ключа (число):\n"
         "Пример: 30"
     )
     await state.set_state(KeyGenStates.waiting_for_days)
-    await callback.answer()
 
 @dp.message(KeyGenStates.waiting_for_days)
 async def process_key_days(message: Message, state: FSMContext):
@@ -766,7 +959,7 @@ async def process_key_days(message: Message, state: FSMContext):
             f"💡 Ключ состоит из 8 символов (буквы и цифры)\n"
             f"Пример: A7B3C9D2",
             parse_mode="Markdown",
-            reply_markup=get_main_keyboard(True)
+            reply_markup=get_main_menu_keyboard(True, True)
         )
     except Exception as e:
         logger.error(f"Gen key error: {e}")
@@ -776,15 +969,14 @@ async def process_key_days(message: Message, state: FSMContext):
         await state.clear()
 
 # ========== ADMIN: BAN ==========
-@dp.callback_query(lambda c: c.data == "ban_player")
-async def ban_player_callback(callback: CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id):
-        await callback.answer("❌ Недостаточно прав!", show_alert=True)
+@dp.message(lambda message: message.text == "🚫 Бан игрока")
+async def ban_player_command(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        await message.answer("❌ Недостаточно прав!")
         return
     
-    await callback.message.answer("Введите логин игрока для бана:")
+    await message.answer("Введите логин игрока для бана:")
     await state.set_state(BanStates.waiting_for_username)
-    await callback.answer()
 
 @dp.message(BanStates.waiting_for_username)
 async def process_ban_user(message: Message, state: FSMContext):
@@ -826,7 +1018,7 @@ async def process_ban_user(message: Message, state: FSMContext):
         await message.answer(
             f"🚫 Игрок {login} забанен!\n"
             f"Все его ключи деактивированы.",
-            reply_markup=get_main_keyboard(True)
+            reply_markup=get_main_menu_keyboard(True, True)
         )
         
         # Уведомляем пользователя
@@ -851,15 +1043,14 @@ async def process_ban_user(message: Message, state: FSMContext):
         await state.clear()
 
 # ========== ADMIN: UNBAN ==========
-@dp.callback_query(lambda c: c.data == "unban_player")
-async def unban_player_callback(callback: CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id):
-        await callback.answer("❌ Недостаточно прав!", show_alert=True)
+@dp.message(lambda message: message.text == "✅ Разбан игрока")
+async def unban_player_command(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        await message.answer("❌ Недостаточно прав!")
         return
     
-    await callback.message.answer("Введите логин игрока для разбана:")
+    await message.answer("Введите логин игрока для разбана:")
     await state.set_state(UnbanStates.waiting_for_username)
-    await callback.answer()
 
 @dp.message(UnbanStates.waiting_for_username)
 async def process_unban_user(message: Message, state: FSMContext):
@@ -894,7 +1085,7 @@ async def process_unban_user(message: Message, state: FSMContext):
         
         await message.answer(
             f"✅ Игрок {login} разбанен!",
-            reply_markup=get_main_keyboard(True)
+            reply_markup=get_main_menu_keyboard(True, True)
         )
         
         # Уведомляем пользователя
@@ -918,18 +1109,17 @@ async def process_unban_user(message: Message, state: FSMContext):
         await state.clear()
 
 # ========== ADMIN: ADD CHANGELOG ==========
-@dp.callback_query(lambda c: c.data == "add_changelog")
-async def add_changelog_callback(callback: CallbackQuery, state: FSMContext):
-    if not await is_admin(callback.from_user.id):
-        await callback.answer("❌ Недостаточно прав!", show_alert=True)
+@dp.message(lambda message: message.text == "📝 Добавить в ченжлог")
+async def add_changelog_command(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        await message.answer("❌ Недостаточно прав!")
         return
     
-    await callback.message.answer(
+    await message.answer(
         "Введите текст новости для ченжлога:\n"
         "Пример: Добавлена новая функция X"
     )
     await state.set_state(ChangelogStates.waiting_for_changelog)
-    await callback.answer()
 
 @dp.message(ChangelogStates.waiting_for_changelog)
 async def process_changelog(message: Message, state: FSMContext):
@@ -961,7 +1151,7 @@ async def process_changelog(message: Message, state: FSMContext):
         await message.answer(
             f"✅ Новость добавлена в ченжлог!\n\n"
             f"📝 {content}",
-            reply_markup=get_main_keyboard(True)
+            reply_markup=get_main_menu_keyboard(True, True)
         )
     except Exception as e:
         logger.error(f"Add changelog error: {e}")
@@ -971,10 +1161,10 @@ async def process_changelog(message: Message, state: FSMContext):
         await state.clear()
 
 # ========== ADMIN: VIEW REQUESTS ==========
-@dp.callback_query(lambda c: c.data == "view_requests")
-async def view_requests_callback(callback: CallbackQuery):
-    if not await is_admin(callback.from_user.id):
-        await callback.answer("❌ Недостаточно прав!", show_alert=True)
+@dp.message(lambda message: message.text == "📋 Заявки на ключи")
+async def view_requests_command(message: Message):
+    if not await is_admin(message.from_user.id):
+        await message.answer("❌ Недостаточно прав!")
         return
     
     conn = await asyncpg.connect(DATABASE_URL)
@@ -990,8 +1180,7 @@ async def view_requests_callback(callback: CallbackQuery):
         )
         
         if not requests:
-            await callback.message.answer("📋 Нет активных заявок на ключи.")
-            await callback.answer()
+            await message.answer("📋 Нет активных заявок на ключи.")
             return
         
         text = "📋 Активные заявки:\n\n"
@@ -1002,16 +1191,15 @@ async def view_requests_callback(callback: CallbackQuery):
             text += f"📅 {req['created_at'].strftime('%d.%m.%Y %H:%M')}\n"
             text += f"---\n"
         
-        await callback.message.answer(
+        await message.answer(
             text,
             reply_markup=get_request_keyboard()
         )
     except Exception as e:
         logger.error(f"View requests error: {e}")
-        await callback.message.answer(f"❌ Ошибка: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
     finally:
         await conn.close()
-        await callback.answer()
 
 # ========== ADMIN: PROCESS KEY REQUEST ==========
 @dp.callback_query(lambda c: c.data in ["approve_key", "reject_key"])
